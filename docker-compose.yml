@@ -1,0 +1,114 @@
+# Fab Lakehouse: on-premise open-source lakehouse on one laptop.
+#   postgres  = source "MES" database (stands in for Oracle)
+#   minio     = S3-compatible object storage (the lake)
+#   rest      = Apache Iceberg REST catalog (table metadata)
+#   spark     = PySpark + Iceberg (ingestion and transformation)
+#   starrocks = MPP OLAP engine (fast SQL serving, materialized views)
+# Needs ~8 GB RAM allocated to Docker Desktop.
+
+name: fab-lakehouse
+
+services:
+  minio:
+    # MinIO removed its own images from Docker Hub (Sep 2026) and Quay now needs a login.
+    # Chainguard publishes a maintained MinIO build; only the :latest tag is free.
+    image: cgr.dev/chainguard/minio:latest
+    user: "0:0"        # the image runs as uid 65532 by default; root avoids volume permission errors in this local demo
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password
+      MINIO_DOMAIN: minio
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # web console -> http://localhost:9001  (admin / password)
+    volumes:
+      - minio_data:/data
+    networks:
+      default:
+        aliases:
+          - warehouse.minio
+
+  bucket-init:
+    # one-shot setup with the official AWS CLI (any S3 client works with MinIO):
+    # create the buckets + a 30-day lifecycle (ILM) rule on the raw landing bucket, then exit
+    image: amazon/aws-cli:latest
+    depends_on:
+      - minio
+    environment:
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+    volumes:
+      - ./config:/config:ro
+    entrypoint: >
+      /bin/sh -c "
+      S3='aws --endpoint-url http://minio:9000';
+      until $$S3 s3 ls >/dev/null 2>&1; do echo 'waiting for minio...'; sleep 2; done;
+      $$S3 s3 mb s3://warehouse 2>/dev/null || true;
+      $$S3 s3 mb s3://landing 2>/dev/null || true;
+      $$S3 s3api put-bucket-lifecycle-configuration --bucket landing --lifecycle-configuration file:///config/landing_lifecycle.json || true;
+      $$S3 s3 ls;
+      echo 'buckets ready';
+      "
+
+  rest:
+    image: apache/iceberg-rest-fixture:latest
+    depends_on:
+      - minio
+    environment:
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+      AWS_REGION: us-east-1
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+    ports:
+      - "8181:8181"
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: fab
+      POSTGRES_PASSWORD: fab
+      POSTGRES_DB: fab_source
+    ports:
+      - "5433:5432"   # 5433 on your Mac so it does not clash with a local Postgres
+    volumes:
+      - ./sql/source/01_mes_schema.sql:/docker-entrypoint-initdb.d/01_mes_schema.sql:ro
+      - ./sql/source:/sql:ro
+      - ./data:/data:ro
+      - pg_data:/var/lib/postgresql/data
+
+  spark:
+    image: tabulario/spark-iceberg:latest
+    depends_on:
+      - rest
+      - minio
+      - postgres
+    environment:
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+      AWS_REGION: us-east-1
+      TZ: UTC
+    ports:
+      - "8888:8888"   # Jupyter notebook -> http://localhost:8888 (optional)
+    volumes:
+      - ./jobs:/home/iceberg/jobs
+
+  starrocks:
+    image: starrocks/allin1-ubuntu:latest
+    depends_on:
+      - rest
+      - minio
+    ports:
+      - "9030:9030"   # MySQL protocol (DBeaver / Power BI MySQL connector / mysql CLI)
+      - "8030:8030"   # FE web UI
+      - "8040:8040"   # BE web UI
+
+volumes:
+  minio_data:
+  pg_data:

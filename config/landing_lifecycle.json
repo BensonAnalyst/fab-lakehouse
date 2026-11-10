@@ -1,0 +1,10 @@
+{
+  "Rules": [
+    {
+      "ID": "expire-raw-landing-files-after-30-days",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "" },
+      "Expiration": { "Days": 30 }
+    }
+  ]
+}
